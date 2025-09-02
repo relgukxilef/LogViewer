@@ -1,0 +1,11 @@
+*
+*.*
+
+!.gitignore
+
+!source
+!source/**
+
+!*.cpp
+!*.h
+!*.txt
