@@ -47,7 +47,8 @@ jobs:
       run: |
         echo "build-output-dir=${{ github.workspace }}/build" >> "$GITHUB_OUTPUT"
 
-    - name: Install prerequisites
+    - name: Try installing prerequisites
+      if: runner.os != 'Windows'
       run: sudo apt-get update -y && sudo apt-get install -y libasound2-dev libglew-dev libglu1-mesa-dev libx11-dev libxcursor-dev libxft-dev libxinerama-dev
 
     - name: Configure CMake

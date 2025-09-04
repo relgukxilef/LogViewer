@@ -19,8 +19,8 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/boostorg/boost.git
     GIT_TAG boost-1.89.0
     GIT_SHALLOW TRUE
-    FIND_PACKAGE_ARGS
     EXCLUDE_FROM_ALL
+    FIND_PACKAGE_ARGS
 )
 FetchContent_MakeAvailable(fltk Boost)
 
