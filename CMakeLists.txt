@@ -12,6 +12,7 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/fltk/fltk.git
     GIT_TAG release-1.4.4
     GIT_SHALLOW TRUE
+    EXCLUDE_FROM_ALL
 )
 FetchContent_Declare(
     Boost
@@ -19,6 +20,7 @@ FetchContent_Declare(
     GIT_TAG boost-1.89.0
     GIT_SHALLOW TRUE
     FIND_PACKAGE_ARGS
+    EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(fltk Boost)
 
