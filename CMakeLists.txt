@@ -31,3 +31,7 @@ add_custom_target(
     DEPENDS LogViewer
     BYPRODUCTS big.csv
 )
+
+target_compile_definitions(
+    LogViewer PRIVATE $<$<BOOL:${UNIX}>:BOOST_ASIO_HAS_IO_URING>
+)
