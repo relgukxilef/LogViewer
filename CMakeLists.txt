@@ -24,7 +24,11 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(fltk boost)
 
 add_executable(LogViewer source/main.cpp)
-target_link_libraries(LogViewer fltk Boost::asio)
+target_link_libraries(
+    LogViewer 
+    fltk Boost::asio
+    $<$<BOOL:${UNIX}>:uring>
+)
 
 add_custom_target(
     test_data LogViewer --make_test_data big.csv
