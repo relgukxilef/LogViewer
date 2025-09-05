@@ -4,7 +4,6 @@
 #include <FL/fl_draw.H>
 
 #include <boost/asio.hpp>
-#include <boost/asio/random_access_file.hpp>
 
 #include <cstring>
 #include <thread>
@@ -36,8 +35,8 @@ struct answer {
 };
 
 struct comma_separate_values {
-    random_access_file file;
-    random_access_file index_file;
+    stream_file file;
+    stream_file index_file;
     vector<char> read_buffers[2];
 
     request current_request;
@@ -202,9 +201,9 @@ int main(int argc, char *argv[]) {
     win.show(argc, argv);
 
     io_context context;
-    random_access_file file(context, "big.csv", random_access_file::read_only);
+    stream_file file(context, "big.csv", random_access_file::read_only);
     vector<char> buffer(1024 * 8);
-    file.read_some_at(0, boost::asio::buffer(buffer));
+    file.read_some(boost::asio::buffer(buffer));
 
     answer new_answer;
     new_answer.total = 1;
