@@ -4,6 +4,7 @@
 #include <FL/fl_draw.H>
 
 #include <boost/asio.hpp>
+#include <boost/asio/random_access_file.hpp>
 
 #include <cstring>
 #include <thread>
@@ -36,14 +37,14 @@ struct answer {
 
 struct comma_separate_values {
     random_access_file file;
-    random_access_file index;
+    random_access_file index_file;
     vector<char> read_buffers[2];
 
     request current_request;
     answer current_answer;
     // Quickselect is only O(n) if accessing a random half of elements only 
     // takes half the time. It might be necessary to copy elements to extra 
-    // files for O(n). But without it's still O(n log n).
+    // files for O(n). But without it's still only O(n log n).
 };
 
 struct parse_state {

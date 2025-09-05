@@ -2,6 +2,8 @@
 *.*
 
 !.gitignore
+!.github
+!.github/**
 
 !source
 !source/**
@@ -9,3 +11,4 @@
 !*.cpp
 !*.h
 !*.txt
+!*.yml

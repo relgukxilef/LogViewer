@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.14)
+cmake_minimum_required(VERSION 3.22) #act only supports 3.22
 project(LogViewer LANGUAGES CXX)
 
 set(CMAKE_VERBOSE_MAKEFILE ON)
@@ -12,17 +12,16 @@ FetchContent_Declare(
     GIT_REPOSITORY https://github.com/fltk/fltk.git
     GIT_TAG release-1.4.4
     GIT_SHALLOW TRUE
-    EXCLUDE_FROM_ALL
+    EXCLUDE_FROM_ALL TRUE
 )
 FetchContent_Declare(
-    Boost
+    boost
     GIT_REPOSITORY https://github.com/boostorg/boost.git
     GIT_TAG boost-1.89.0
     GIT_SHALLOW TRUE
-    FIND_PACKAGE_ARGS
-    EXCLUDE_FROM_ALL
+    EXCLUDE_FROM_ALL TRUE
 )
-FetchContent_MakeAvailable(fltk Boost)
+FetchContent_MakeAvailable(fltk boost)
 
 add_executable(LogViewer source/main.cpp)
 target_link_libraries(LogViewer fltk Boost::asio)
