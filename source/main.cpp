@@ -4,7 +4,6 @@
 #include <FL/fl_draw.H>
 
 #include <boost/asio.hpp>
-#include <boost/asio/random_access_file.hpp>
 
 #include <cstring>
 #include <thread>
@@ -18,34 +17,6 @@
 
 using namespace std;
 using namespace boost::asio;
-
-struct request {
-    size_t anchor = 0;
-    size_t offset = 0;
-    size_t window_height = 16;
-    vector<unsigned> sort_columns;
-    vector<unsigned> column_widths;
-};
-
-struct answer {
-    vector<char> characters;
-    // cell texts in {buffer.data() + cell[c], buffer.data() + cell[c + 1]}
-    // first row is header
-    vector<unsigned> cells;
-    unsigned width = 0, height = 0, position = 0, total = 0;
-};
-
-struct comma_separate_values {
-    random_access_file file;
-    random_access_file index_file;
-    vector<char> read_buffers[2];
-
-    request current_request;
-    answer current_answer;
-    // Quickselect is only O(n) if accessing a random half of elements only 
-    // takes half the time. It might be necessary to copy elements to extra 
-    // files for O(n). But without it's still only O(n log n).
-};
 
 struct parse_state {
     size_t column = 0, row = 0, cell_character = 0, file_byte = 0;
@@ -89,8 +60,105 @@ pair<unsigned, parse_result> next_cell(
             characters_read++;
         }
         // TODO: escaping and quotes
+        // TODO: some maniacs don't escape their newlines, this means that we
+        // have to read ahead an entire row to determine the end of the current
+        // Maybe this function should be inlined into the request processing
     }
     return {characters_read, done};
+}
+
+struct column_sort {
+    unsigned column;
+    bool ascending = true;
+};
+
+struct request {
+    size_t anchor = 0;
+    size_t offset = 0;
+    size_t window_height = 16;
+    vector<column_sort> sort_columns;
+    vector<unsigned> column_widths;
+};
+
+struct answer {
+    vector<char> characters;
+    // cell texts in {buffer.data() + cell[c], buffer.data() + cell[c + 1]}
+    // first row is header
+    vector<unsigned> cells;
+    unsigned width = 0, height = 0, position = 0, total = 0;
+};
+
+struct pivot {
+    size_t byte_offset;
+    size_t rank_lower_bound, rank_upper_bound;
+    // to sort:
+    // Pick first row as pivot and count how many rows are below and above until
+    // the bounds are outside of the visible window.
+    // Pick a new counter, e.g. by just iterating over rows until you find a
+    // smaller/bigger one, depending on the side of the window.
+    // Repeat until the top 
+};
+
+struct comma_separate_values {
+    comma_separate_values(io_context::executor_type executor);
+    awaitable<pair<answer, request>> async_query(request r, answer a);
+
+    random_access_file file;
+    vector<char> read_buffer;
+
+    pivot sort_pivot; 
+    // Need at least one pivot, but could have more for performance
+    // Comparing two rows requires reading them, and they can have any length
+
+    request current_request;
+    answer current_answer;
+    // Quickselect is only O(n) if accessing a random half of elements only 
+    // takes half the time. It might be necessary to copy elements to extra 
+    // files for O(n). But without it's still only O(n log n).
+};
+
+comma_separate_values::comma_separate_values(
+    io_context::executor_type executor
+) : file(executor) {}
+
+awaitable<pair<answer, request>> comma_separate_values::async_query(
+    request r, answer a
+) {
+    // TODO: reuse content of last request/answer
+    file.open("big.csv", random_access_file::read_only);
+    read_buffer.resize(1024 * 8);
+
+    co_await async_read_at(file, 0, buffer(read_buffer), use_awaitable);
+
+    a.total = 1;
+    a.height = 1;
+    a.characters.resize(1024 * 8);
+    a.cells.push_back(0);
+    a.cells.push_back(0);
+    parse_state state;
+    span<char> characters = a.characters;
+    span<const char> bytes = read_buffer;
+    unsigned width = 0;
+    while (!bytes.empty() && !characters.empty()) {
+        auto result = next_cell(state, characters, bytes);
+        a.cells.back() += result.first;
+        if (result.second != parse_result::again) {
+            a.cells.push_back(a.cells.back());
+            width++;
+        }
+        if (result.second == parse_result::row_done) {
+            a.width = max(width, a.width);
+            width = 0;
+            a.total++;
+            a.height++;
+        }
+    }
+    while (width++ < a.width) {
+        // fill up last row
+        a.cells.push_back(a.cells.back());
+    }
+
+    co_return pair<answer, request>{a, r};
 }
 
 int main(int argc, char *argv[]) {
@@ -202,40 +270,23 @@ int main(int argc, char *argv[]) {
     win.show(argc, argv);
 
     io_context context;
-    random_access_file file(context, "big.csv", random_access_file::read_only);
-    vector<char> buffer(1024 * 8);
-    file.read_some_at(0, boost::asio::buffer(buffer));
 
-    answer new_answer;
-    new_answer.total = 1;
-    new_answer.height = 1;
-    new_answer.characters.resize(1024 * 8);
-    new_answer.cells.push_back(0);
-    new_answer.cells.push_back(0);
-    parse_state state;
-    span<char> characters = new_answer.characters;
-    span<const char> bytes = buffer;
-    unsigned width = 0;
-    while (!bytes.empty() && !characters.empty()) {
-        auto result = next_cell(state, characters, bytes);
-        new_answer.cells.back() += result.first;
-        if (result.second != parse_result::again) {
-            new_answer.cells.push_back(new_answer.cells.back());
-            width++;
+    comma_separate_values file(context.get_executor());
+    
+    co_spawn(
+        context, file.async_query({}, {}), 
+        [&] (exception_ptr, pair<answer, request> result) {
+            auto lambda = [&, result = std::move(result)] () mutable { 
+                table.replace_content(result.first); 
+            };
+            Fl::awake(
+                [](void *lambda_pointer) {
+                    (*((decltype(lambda)*)lambda_pointer))();
+                }, 
+                new decltype(lambda)(std::move(lambda))
+            );
         }
-        if (result.second == parse_result::row_done) {
-            new_answer.width = max(width, new_answer.width);
-            width = 0;
-            new_answer.total++;
-            new_answer.height++;
-        }
-    }
-    while (width++ < new_answer.width) {
-        // fill up last row
-        new_answer.cells.push_back(new_answer.cells.back());
-    }
-
-    table.replace_content(new_answer);
+    );
 
     jthread worker;
     auto work = make_work_guard(context);
@@ -243,11 +294,6 @@ int main(int argc, char *argv[]) {
     worker = jthread([&](){
         context.run();
     });
-
-    // TODO: pass requests to io_context via co_spawn
-    // and results to main thread via Fk::awake(function, void*).
-    // Requests should not be queued. Instead, a new request is filed when none
-    // is pending, or when a request finishes and one is pending.
 
     return Fl::run();
 }
