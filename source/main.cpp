@@ -18,6 +18,8 @@
 using namespace std;
 using namespace boost::asio;
 
+const size_t READ_SIZE = 1024 * 8;
+
 struct parse_state {
     size_t column = 0, row = 0, cell_character = 0, file_byte = 0;
     bool escaped = false, quoted = false;
@@ -33,7 +35,7 @@ pair<unsigned, parse_result> next_cell(
 ) {
     unsigned characters_read = 0;
     parse_result done = parse_result::again;
-    while (!bytes.empty()) {
+    while (!bytes.empty() && !characters.empty()) {
         auto b = bytes[0];
         bytes = bytes.subspan(1);
         state.file_byte++;
@@ -49,16 +51,13 @@ pair<unsigned, parse_result> next_cell(
             state.row++;
             done = parse_result::row_done;
             break;
-            
-        } else if (characters.empty()) {
-            break;
-
-        } else {
-            characters[0] = b;
-            characters = characters.subspan(1);
-            state.cell_character++;
-            characters_read++;
         }
+
+        characters[0] = b;
+        characters = characters.subspan(1);
+        state.cell_character++;
+        characters_read++;
+        
         // TODO: escaping and quotes
         // TODO: some maniacs don't escape their newlines, this means that we
         // have to read ahead an entire row to determine the end of the current
@@ -75,7 +74,7 @@ struct column_sort {
 struct request {
     size_t anchor = 0;
     size_t offset = 0;
-    size_t window_height = 16;
+    size_t window_height = 0;
     vector<column_sort> sort_columns;
     vector<unsigned> column_widths;
 };
@@ -119,38 +118,53 @@ struct comma_separate_values {
 
 comma_separate_values::comma_separate_values(
     io_context::executor_type executor
-) : file(executor) {}
+) : file(executor, "big.csv", random_access_file::read_only) {
+    read_buffer.resize(READ_SIZE);
+}
 
 awaitable<pair<answer, request>> comma_separate_values::async_query(
     request r, answer a
 ) {
+    file.cancel();
     // TODO: reuse content of last request/answer
-    file.open("big.csv", random_access_file::read_only);
-    read_buffer.resize(1024 * 8);
 
-    co_await async_read_at(file, 0, buffer(read_buffer), use_awaitable);
-
+    unsigned width = 0;
     a.total = 1;
     a.height = 1;
-    a.characters.resize(1024 * 8);
+    a.characters.resize(1024);
     a.cells.push_back(0);
     a.cells.push_back(0);
     parse_state state;
     span<char> characters = a.characters;
-    span<const char> bytes = read_buffer;
-    unsigned width = 0;
-    while (!bytes.empty() && !characters.empty()) {
-        auto result = next_cell(state, characters, bytes);
-        a.cells.back() += result.first;
-        if (result.second != parse_result::again) {
-            a.cells.push_back(a.cells.back());
-            width++;
-        }
-        if (result.second == parse_result::row_done) {
-            a.width = max(width, a.width);
-            width = 0;
-            a.total++;
-            a.height++;
+    // TODO: check for end of file
+    while (
+        co_await async_read_at(
+            file, state.file_byte, buffer(read_buffer), use_awaitable
+        ) &&
+        a.height < r.window_height
+    ) {
+        span<const char> bytes = read_buffer;
+        while (
+            !bytes.empty() && a.height < r.window_height
+        ) {
+            if (characters.empty()) {
+                auto size = a.characters.size();
+                a.characters.resize(size * 2);
+                characters = a.characters;
+                characters = characters.subspan(size);
+            }
+            auto result = next_cell(state, characters, bytes);
+            a.cells.back() += result.first;
+            if (result.second != parse_result::again) {
+                a.cells.push_back(a.cells.back());
+                width++;
+            }
+            if (result.second == parse_result::row_done) {
+                a.width = max(width, a.width);
+                width = 0;
+                a.total++;
+                a.height++;
+            }
         }
     }
     while (width++ < a.width) {
@@ -159,6 +173,76 @@ awaitable<pair<answer, request>> comma_separate_values::async_query(
     }
 
     co_return pair<answer, request>{a, r};
+}
+
+struct table : public Fl_Table_Row {
+    answer view;
+
+    table(int x, int y, int w, int h) : Fl_Table_Row(x, y, w, h) {
+        col_header(1);
+        col_header_height(25);
+        col_resize(1);
+        row_header(0);
+        end(); // signals the end of the widgets constructor
+    }
+
+    void replace_content(answer &new_view) {
+        swap(view, new_view);
+        rows(view.height + 2);
+        cols(view.width);
+        row_height_all(25);
+        col_width_all(100);
+    }
+
+    void draw_cell(
+        TableContext context, int row, int column, 
+        int x, int y, int w, int h
+    ) override {
+        if (context == CONTEXT_COL_HEADER) {
+            fl_draw_box(FL_THIN_UP_BOX, x, y, w, h, FL_GRAY);
+            fl_color(FL_BLACK);
+            fl_draw(
+                view.characters.data() + view.cells[column], 
+                view.cells[column + 1] - view.cells[column],
+                x, y + 25 / 2 + fl_height() / 2
+            );
+
+        } else if (context == CONTEXT_CELL) {
+            fl_draw_box(FL_FLAT_BOX, x, y, w, h, FL_WHITE);
+            fl_color(FL_BLACK);
+            if (row == 0 || (unsigned)row >= view.height)
+                // top and bottom row are placeholders
+                return;
+            // row 0 is header
+            auto cell = row * view.width + column;
+            // TODO: use fl_width to find out width of text
+            fl_draw(
+                view.characters.data() + view.cells[cell], 
+                view.cells[cell + 1] - view.cells[cell],
+                x, y + 25 / 2 + fl_height() / 2
+            );
+        }
+    }
+};
+
+void request_update(
+    io_context::executor_type executor, table &table, 
+    comma_separate_values &file
+) {
+    co_spawn(
+        executor, file.async_query({.window_height = 200}, {}), 
+        [&] (exception_ptr, pair<answer, request> result) {
+            auto lambda = [&, result = std::move(result)] () mutable { 
+                table.replace_content(result.first); 
+            };
+            Fl::awake(
+                [](void *lambda_pointer) {
+                    (*((decltype(lambda)*)lambda_pointer))();
+                }, 
+                new decltype(lambda)(std::move(lambda))
+            );
+        }
+    );
 }
 
 int main(int argc, char *argv[]) {
@@ -213,57 +297,8 @@ int main(int argc, char *argv[]) {
     }
 
     Fl_Window win(400, 200, "BraceYourselfViewer");
-    struct MyTable : public Fl_Table_Row {
-        answer view;
-    
-        MyTable(int x, int y, int w, int h) : Fl_Table_Row(x, y, w, h) {
-            col_header(1);
-            col_header_height(25);
-            col_resize(1);
-            row_header(0);
-            end(); // signals the end of the widgets constructor
-        }
 
-        void replace_content(answer &new_view) {
-            swap(view, new_view);
-            rows(view.height + 2);
-            cols(view.width);
-            row_height_all(25);
-            col_width_all(100);
-        }
-
-        void draw_cell(
-            TableContext context, int row, int column, 
-            int x, int y, int w, int h
-        ) override {
-            if (context == CONTEXT_COL_HEADER) {
-                fl_draw_box(FL_THIN_UP_BOX, x, y, w, h, FL_GRAY);
-                fl_color(FL_BLACK);
-                fl_draw(
-                    view.characters.data() + view.cells[column], 
-                    view.cells[column + 1] - view.cells[column],
-                    x, y + 25 / 2 + fl_height() / 2
-                );
-
-            } else if (context == CONTEXT_CELL) {
-                fl_draw_box(FL_FLAT_BOX, x, y, w, h, FL_WHITE);
-                fl_color(FL_BLACK);
-                if (row == 0 || (unsigned)row >= view.height)
-                    // top and bottom row are placeholders
-                    return;
-                // row 0 is header
-                auto cell = row * view.width + column;
-                // TODO: use fl_width to find out width of text
-                fl_draw(
-                    view.characters.data() + view.cells[cell], 
-                    view.cells[cell + 1] - view.cells[cell],
-                    x, y + 25 / 2 + fl_height() / 2
-                );
-            }
-        }
-    };
-
-    MyTable table(0, 0, 400, 200);
+    ::table table(0, 0, 400, 200);
     table.resizable(&table);
     win.resizable(&table);
     win.end();
@@ -272,21 +307,8 @@ int main(int argc, char *argv[]) {
     io_context context;
 
     comma_separate_values file(context.get_executor());
-    
-    co_spawn(
-        context, file.async_query({}, {}), 
-        [&] (exception_ptr, pair<answer, request> result) {
-            auto lambda = [&, result = std::move(result)] () mutable { 
-                table.replace_content(result.first); 
-            };
-            Fl::awake(
-                [](void *lambda_pointer) {
-                    (*((decltype(lambda)*)lambda_pointer))();
-                }, 
-                new decltype(lambda)(std::move(lambda))
-            );
-        }
-    );
+
+    request_update(context.get_executor(), table, file);
 
     jthread worker;
     auto work = make_work_guard(context);
