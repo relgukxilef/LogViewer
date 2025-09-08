@@ -69,6 +69,8 @@ pair<unsigned, parse_result> next_cell(
 struct column_sort {
     unsigned column;
     bool ascending = true;
+
+    bool operator==(const column_sort&) const = default;
 };
 
 struct request {
@@ -77,6 +79,8 @@ struct request {
     size_t window_height = 0;
     vector<column_sort> sort_columns;
     vector<unsigned> column_widths;
+
+    bool operator==(const request&) const = default;
 };
 
 struct answer {
@@ -100,7 +104,7 @@ struct pivot {
 
 struct comma_separate_values {
     comma_separate_values(io_context::executor_type executor);
-    awaitable<pair<answer, request>> async_query(request r, answer a);
+    awaitable<pair<answer, request>> query(request r, answer a);
 
     random_access_file file;
     vector<char> read_buffer;
@@ -122,16 +126,16 @@ comma_separate_values::comma_separate_values(
     read_buffer.resize(READ_SIZE);
 }
 
-awaitable<pair<answer, request>> comma_separate_values::async_query(
+awaitable<pair<answer, request>> comma_separate_values::query(
     request r, answer a
 ) {
-    file.cancel();
     // TODO: reuse content of last request/answer
 
     unsigned width = 0;
     a.total = 1;
     a.height = 1;
     a.characters.resize(1024);
+    a.cells.clear();
     a.cells.push_back(0);
     a.cells.push_back(0);
     parse_state state;
@@ -141,11 +145,11 @@ awaitable<pair<answer, request>> comma_separate_values::async_query(
         co_await async_read_at(
             file, state.file_byte, buffer(read_buffer), use_awaitable
         ) &&
-        a.height < r.window_height
+        a.height <= r.window_height
     ) {
         span<const char> bytes = read_buffer;
         while (
-            !bytes.empty() && a.height < r.window_height
+            !bytes.empty() && a.height <= r.window_height
         ) {
             if (characters.empty()) {
                 auto size = a.characters.size();
@@ -175,10 +179,23 @@ awaitable<pair<answer, request>> comma_separate_values::async_query(
     co_return pair<answer, request>{a, r};
 }
 
-struct table : public Fl_Table_Row {
-    answer view;
+void request_update(
+    io_context::executor_type executor, struct table &table, 
+    comma_separate_values &file
+);
 
-    table(int x, int y, int w, int h) : Fl_Table_Row(x, y, w, h) {
+struct table : public Fl_Table_Row {
+    io_context::executor_type executor;
+    comma_separate_values *file;
+    answer view, last_answer;
+    request next_request, last_request;
+    bool busy = false;
+
+    table(
+        io_context::executor_type executor,
+        int x, int y, int w, int h,
+        comma_separate_values *file
+    ) : Fl_Table_Row(x, y, w, h), executor(executor), file(file) {
         col_header(1);
         col_header_height(25);
         col_resize(1);
@@ -186,19 +203,27 @@ struct table : public Fl_Table_Row {
         end(); // signals the end of the widgets constructor
     }
 
-    void replace_content(answer &new_view) {
-        swap(view, new_view);
+    void replace_content(const answer &new_view) {
+        view = new_view;
         rows(view.height + 2);
         cols(view.width);
         row_height_all(25);
-        col_width_all(100);
+        row_height(0, new_view.position * 25);
+        row_height(
+            new_view.height + 1, 
+            (new_view.total - new_view.height - new_view.position) * 25
+        );
     }
 
     void draw_cell(
         TableContext context, int row, int column, 
         int x, int y, int w, int h
     ) override {
-        if (context == CONTEXT_COL_HEADER) {
+        if (context == CONTEXT_RC_RESIZE) {
+            next_request.window_height = this->h() / 25;
+            request_update(executor, *this, *file);
+
+        } else if (context == CONTEXT_COL_HEADER) {
             fl_draw_box(FL_THIN_UP_BOX, x, y, w, h, FL_GRAY);
             fl_color(FL_BLACK);
             fl_draw(
@@ -229,11 +254,26 @@ void request_update(
     io_context::executor_type executor, table &table, 
     comma_separate_values &file
 ) {
+    if (table.busy) {
+        // last request hasn't returned yet
+        return;
+    }
+    if (table.next_request == table.last_request) {
+        // nothing to do
+        return;
+    }
+    table.busy = true;
+    table.last_request = table.next_request;
     co_spawn(
-        executor, file.async_query({.window_height = 200}, {}), 
-        [&] (exception_ptr, pair<answer, request> result) {
-            auto lambda = [&, result = std::move(result)] () mutable { 
-                table.replace_content(result.first); 
+        executor, 
+        file.query(std::move(table.last_request), std::move(table.last_answer)),
+        [&, executor] (exception_ptr, pair<answer, request> result) {
+            auto lambda = [&, result = std::move(result), executor] () mutable {
+                table.last_answer = std::move(result.first);
+                table.last_request = std::move(result.second);
+                table.replace_content(table.last_answer);
+                table.busy = false;
+                request_update(executor, table, file);
             };
             Fl::awake(
                 [](void *lambda_pointer) {
@@ -298,17 +338,15 @@ int main(int argc, char *argv[]) {
 
     Fl_Window win(400, 200, "BraceYourselfViewer");
 
-    ::table table(0, 0, 400, 200);
-    table.resizable(&table);
-    win.resizable(&table);
-    win.end();
-    win.show(argc, argv);
-
     io_context context;
 
     comma_separate_values file(context.get_executor());
 
-    request_update(context.get_executor(), table, file);
+    ::table table(context.get_executor(), 0, 0, 400, 200, &file);
+    table.resizable(&table);
+    win.resizable(&table);
+    win.end();
+    win.show(argc, argv);
 
     jthread worker;
     auto work = make_work_guard(context);
