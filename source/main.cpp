@@ -1,5 +1,5 @@
 #include <FL/Fl.H>
-#include <FL/Fl_Window.H>
+#include <FL/Fl_Double_Window.H>
 #include <FL/Fl_Table_Row.H>
 #include <FL/fl_draw.H>
 
@@ -134,12 +134,14 @@ awaitable<pair<answer, request>> comma_separate_values::query(
     unsigned width = 0;
     a.total = 1;
     a.height = 1;
+    a.position = r.offset;
     a.characters.resize(1024);
     a.cells.clear();
     a.cells.push_back(0);
     a.cells.push_back(0);
     parse_state state;
     span<char> characters = a.characters;
+    bool header = true;
     // TODO: check for end of file
     while (
         co_await async_read_at(
@@ -157,17 +159,24 @@ awaitable<pair<answer, request>> comma_separate_values::query(
                 characters = a.characters;
                 characters = characters.subspan(size);
             }
+            span<char> previous = characters;
             auto result = next_cell(state, characters, bytes);
-            a.cells.back() += result.first;
+            if (a.total > r.offset + 1 || header)
+                a.cells.back() += result.first;
+            else
+                characters = previous;
             if (result.second != parse_result::again) {
-                a.cells.push_back(a.cells.back());
+                if (a.total > r.offset + 1 || header)
+                    a.cells.push_back(a.cells.back());
                 width++;
             }
             if (result.second == parse_result::row_done) {
                 a.width = max(width, a.width);
                 width = 0;
+                if (a.total > r.offset + 1 || header)
+                    a.height++;
+                header = false;
                 a.total++;
-                a.height++;
             }
         }
     }
@@ -207,12 +216,13 @@ struct table : public Fl_Table_Row {
         view = new_view;
         rows(view.height + 2);
         cols(view.width);
-        row_height_all(25);
-        row_height(0, new_view.position * 25);
+        row_height(0, view.position * 25);
         row_height(
-            new_view.height + 1, 
-            (new_view.total - new_view.height - new_view.position) * 25
+            view.height + 1, 
+            (view.total - view.height - view.position + 2) * 25
         );
+        for (int i = 0; i < view.height; i++)
+            row_height(i + 1, 25);
     }
 
     void draw_cell(
@@ -221,6 +231,7 @@ struct table : public Fl_Table_Row {
     ) override {
         if (context == CONTEXT_RC_RESIZE) {
             next_request.window_height = this->h() / 25;
+            next_request.offset = vscrollbar->value() / 25;
             request_update(executor, *this, *file);
 
         } else if (context == CONTEXT_COL_HEADER) {
@@ -336,7 +347,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    Fl_Window win(400, 200, "BraceYourselfViewer");
+    Fl_Double_Window win(400, 200, "BraceYourselfViewer");
 
     io_context context;
 
