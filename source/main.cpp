@@ -89,6 +89,7 @@ struct answer {
     // first row is header
     vector<unsigned> cells;
     unsigned width = 0, height = 0, position = 0, total = 0;
+    bool complete = false;
 };
 
 struct pivot {
@@ -129,11 +130,14 @@ comma_separate_values::comma_separate_values(
 awaitable<pair<answer, request>> comma_separate_values::query(
     request r, answer a
 ) {
+    boost::system::error_code error;
+    auto completion_token = redirect_error(use_awaitable, error);
     // TODO: reuse content of last request/answer
+    a = current_answer;
 
-    unsigned width = 0;
     a.total = 1;
     a.height = 1;
+    a.width = 0;
     a.position = r.offset;
     a.characters.resize(1024);
     a.cells.clear();
@@ -141,49 +145,100 @@ awaitable<pair<answer, request>> comma_separate_values::query(
     a.cells.push_back(0);
     parse_state state;
     span<char> characters = a.characters;
-    bool header = true;
     // TODO: check for end of file
-    while (
-        co_await async_read_at(
-            file, state.file_byte, buffer(read_buffer), use_awaitable
-        ) &&
-        a.height <= r.window_height
-    ) {
-        span<const char> bytes = read_buffer;
-        while (
-            !bytes.empty() && a.height <= r.window_height
-        ) {
-            if (characters.empty()) {
-                auto size = a.characters.size();
-                a.characters.resize(size * 2);
-                characters = a.characters;
-                characters = characters.subspan(size);
-            }
-            span<char> previous = characters;
-            auto result = next_cell(state, characters, bytes);
-            if (a.total > r.offset + 1 || header)
-                a.cells.back() += result.first;
-            else
-                characters = previous;
-            if (result.second != parse_result::again) {
-                if (a.total > r.offset + 1 || header)
-                    a.cells.push_back(a.cells.back());
-                width++;
-            }
-            if (result.second == parse_result::row_done) {
-                a.width = max(width, a.width);
-                width = 0;
-                if (a.total > r.offset + 1 || header)
-                    a.height++;
-                header = false;
-                a.total++;
-            }
+    pair<unsigned, parse_result> result = {0, parse_result::again};
+    span<const char> bytes;
+    // read header
+    // TODO: skip if it's already been read
+    do {
+        if (bytes.empty()) {
+            bytes = read_buffer;
+            co_await async_read_at(
+                file, state.file_byte, buffer(read_buffer), completion_token
+            );
+        }
+        if (characters.empty()) {
+            auto size = a.characters.size();
+            a.characters.resize(size * 2);
+            characters = a.characters;
+            characters = characters.subspan(size);
+        }
+        result = next_cell(state, characters, bytes);
+        a.cells.back() += result.first;
+        if (result.second != parse_result::again) {
+            a.cells.push_back(a.cells.back());
+            a.width++;
+        }
+    } while (result.second != parse_result::row_done);
+    // skip to first visible row
+    while (a.total < r.offset) {
+        if (bytes.empty()) {
+            bytes = read_buffer;
+            co_await async_read_at(
+                file, state.file_byte, buffer(read_buffer), completion_token
+            );
+        }
+        char null[READ_SIZE];
+        span<char> null_span = null;
+        result = next_cell(state, null_span, bytes);
+        if (result.second == parse_result::row_done) {
+            a.total++;
         }
     }
-    while (width++ < a.width) {
-        // fill up last row
-        a.cells.push_back(a.cells.back());
+    // read rows
+    int width = 0;
+    while (a.height <= r.window_height) {
+        if (bytes.empty()) {
+            bytes = read_buffer;
+            co_await async_read_at(
+                file, state.file_byte, buffer(read_buffer), completion_token
+            );
+        }
+        if (characters.empty()) {
+            auto size = a.characters.size();
+            a.characters.resize(size * 2);
+            characters = a.characters;
+            characters = characters.subspan(size);
+        }
+        result = next_cell(state, characters, bytes);
+        a.cells.back() += result.first;
+        if (result.second != parse_result::again) {
+            a.cells.push_back(a.cells.back());
+            width++;
+        }
+        if (result.second == parse_result::row_done) {
+            // fill up last row in case it's incomplete
+            while (width < a.width) {
+                width++;
+                a.cells.push_back(a.cells.back());
+            }
+            a.height++;
+            a.total++;
+            width = 0;
+        }
     }
+    while (!a.complete) {
+        // iterate over the rest of the file to figure out the total size
+        // this only needs to be done once (per filter)
+        if (bytes.empty()) {
+            size_t size = co_await async_read_at(
+                file, state.file_byte, buffer(read_buffer), completion_token
+            );
+            bytes = {read_buffer.begin(), read_buffer.begin() + size};
+            if (size == 0) {
+                a.complete = true;
+                current_answer.total = a.total;
+            }
+        }
+        char null[READ_SIZE];
+        span<char> null_span = null;
+        result = next_cell(state, null_span, bytes);
+        if (result.second == parse_result::row_done) {
+            a.total++;
+        }
+    }
+    a.total = current_answer.total;
+    current_answer = a;
 
     co_return pair<answer, request>{a, r};
 }
